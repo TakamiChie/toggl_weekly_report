@@ -335,24 +335,12 @@ def build_report(
         f"* ワークスペースの総作業時間: {format_duration(total)}({format_diff(total - previous_total)})",
         f"* 平均: {format_duration(total / 7)}({format_diff((total - previous_total) / 7)})",
         "",
-        "### 上位三件",
+        "### 今週の活動内容（実施時間の長い順）",
         "",
     ]
     descending = sorted(projects.items(), key=lambda item: item[1], reverse=True)
-    ascending = sorted(
-        ((name, value) for name, value in projects.items() if value > 0),
-        key=lambda item: item[1],
-    )
     lines.extend(
-        project_lines(
-            descending[:3], total, previous_projects, current_work, project_names
-        )
-    )
-    lines += ["", "### 下位三件", ""]
-    lines.extend(
-        project_lines(
-            ascending[:3], total, previous_projects, current_work, project_names
-        )
+        project_lines(descending, total, previous_projects, current_work, project_names)
     )
 
     current_clients = aggregate_clients(current_work, project_clients, client_names)
@@ -376,12 +364,13 @@ def build_report(
                         and client_names.get(
                             entry.get("client_id")
                             or project_clients.get(entry.get("project_id"))
-                        ) == name
+                        )
+                        == name
                         and entry.get("project_id") in project_names
                     }
                 )
                 if assigned_projects:
-                    lines.append(f"  * プロジェクト: {', '.join(assigned_projects)}")
+                    lines.append(f"    * プロジェクト: {', '.join(assigned_projects)}")
     else:
         lines.append("クライアントに紐づく作業時間がありませんでした。")
 
@@ -460,18 +449,61 @@ def project_lines(
                 }
             )
             if descriptions:
-                lines.append(f"   * 内容: {', '.join(descriptions)}")
+                lines.append(f"    * 内容: {', '.join(descriptions)}")
     if not lines:
         lines.append("対象データがありません。")
     return lines
 
 
+def load_local_report_data(current_path: Path, previous_path: Path) -> tuple:
+    # Read both weeks, with current names taking precedence for existing IDs.
+    rows = []
+    for path in (previous_path, current_path):
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            rows.extend(csv.DictReader(handle))
+
+    name_maps = {}
+    id_maps = {}
+    for category in ("ワークスペース", "プロジェクト", "クライアント"):
+        by_id = {}
+        by_name = {}
+        for row in rows:
+            item_id = optional_int(row.get(f"{category}ID"))
+            name = row.get(f"{category}名", "").strip()
+            if item_id is not None and name:
+                by_id[item_id] = name
+                by_name[name] = item_id
+        # Older CSVs may contain names without IDs. Give those stable local IDs.
+        for row in rows:
+            name = row.get(f"{category}名", "").strip()
+            if name and name not in ("No Project", "No Client") and name not in by_name:
+                item_id = min([0, *by_id]) - 1
+                by_name[name] = item_id
+                by_id[item_id] = name
+        name_maps[category] = by_name
+        id_maps[category] = by_id
+
+    work_workspace_id = name_maps["ワークスペース"].get("work")
+    if work_workspace_id is None:
+        work_workspace_id = int(required_env("TOGGL_WORK_WORKSPACE_ID"))
+    mappings = (
+        name_maps["ワークスペース"],
+        name_maps["プロジェクト"],
+        name_maps["クライアント"],
+    )
+    return (
+        load_comparison_csv(current_path, *mappings),
+        load_comparison_csv(previous_path, *mappings),
+        work_workspace_id,
+        id_maps["プロジェクト"],
+        {},  # Each CSV entry already carries its client assignment.
+        id_maps["クライアント"],
+    )
+
+
 def main() -> int:
     args = parse_args()
     try:
-        token = required_env("TOGGL_API_TOKEN")
-        work_workspace_id = int(required_env("TOGGL_WORK_WORKSPACE_ID"))
-        life_workspace_id = int(required_env("TOGGL_LIFE_WORKSPACE_ID"))
         week = determine_week(args.week_ending)
     except ValueError as error:
         print(f"設定エラー: {error}", file=sys.stderr)
@@ -479,6 +511,30 @@ def main() -> int:
 
     works_dir = args.works_dir.resolve()
     works_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = works_dir / f"toggl_activity_log_full_{week.ending_date:%Y-%m-%d}.csv"
+    comparison_end = week.ending_date - timedelta(days=7)
+    comparison_path = (
+        works_dir / f"toggl_activity_log_full_{comparison_end:%Y-%m-%d}.csv"
+    )
+    if csv_path.is_file() and comparison_path.is_file():
+        try:
+            report = build_report(
+                week, *load_local_report_data(csv_path, comparison_path)
+            )
+        except (OSError, ValueError, csv.Error) as error:
+            print(f"ローカルCSVの読み込みに失敗しました: {error}", file=sys.stderr)
+            return 1
+        print("ローカルCSVから集計しました（Toggl APIは使用していません）。")
+        output_report(args, week, report, csv_path)
+        return 0
+
+    try:
+        token = required_env("TOGGL_API_TOKEN")
+        work_workspace_id = int(required_env("TOGGL_WORK_WORKSPACE_ID"))
+        life_workspace_id = int(required_env("TOGGL_LIFE_WORKSPACE_ID"))
+    except ValueError as error:
+        print(f"設定エラー: {error}", file=sys.stderr)
+        return 2
     workspaces = {"work": work_workspace_id, "life": life_workspace_id}
     session = requests.Session()
     session.auth = (token, "api_token")
@@ -507,7 +563,6 @@ def main() -> int:
     client_names = {c["id"]: c["name"] for c in clients}
     workspace_names = {value: key for key, value in workspaces.items()}
 
-    csv_path = works_dir / f"toggl_activity_log_full_{week.ending_date:%Y-%m-%d}.csv"
     save_csv(
         csv_path,
         entries,
@@ -517,10 +572,6 @@ def main() -> int:
         client_names,
     )
 
-    comparison_end = week.ending_date - timedelta(days=7)
-    comparison_path = (
-        works_dir / f"toggl_activity_log_full_{comparison_end:%Y-%m-%d}.csv"
-    )
     comparison_entries = load_comparison_csv(
         comparison_path,
         {name: value for value, name in workspace_names.items()},
@@ -536,13 +587,21 @@ def main() -> int:
         project_clients,
         client_names,
     )
+    output_report(args, week, report, csv_path)
+    return 0
+
+
+def output_report(
+    args: argparse.Namespace, week: WeekRange, report: str, csv_path: Path
+) -> None:
     print(report, end="")
     print(f"\nCSV保存先: {csv_path}")
     if not args.no_report_file:
-        report_path = works_dir / f"toggl_weekly_report_{week.ending_date:%Y-%m-%d}.md"
+        report_path = (
+            csv_path.parent / f"toggl_weekly_report_{week.ending_date:%Y-%m-%d}.md"
+        )
         report_path.write_text(report, encoding="utf-8")
         print(f"レポート保存先: {report_path}")
-    return 0
 
 
 if __name__ == "__main__":
